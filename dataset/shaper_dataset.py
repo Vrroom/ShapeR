@@ -86,6 +86,7 @@ class InferenceDataset(torch.utils.data.Dataset):
             "semi_dense_points": selected_semi_dense_points,
             "caption": self.get_caption(pkl_sample),
             "scale": scale,
+            "bounds": bounds,
         }
 
         # check if images are present
