@@ -55,6 +55,8 @@ class ODESolver:
           The last timestep when return_intermediates=False, otherwise all values specified in time_grid.
         """
 
+        print(method)
+
         def ode_func(t, x):
             return self.velocity_model(x=x, t=t, **model_extras)
 

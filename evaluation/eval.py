@@ -26,6 +26,9 @@ from dataset.shaper_dataset import InferenceDataset
 from model.flow_matching.shaper_denoiser import ShapeRDenoiser
 from model.text.hf_embedder import TextFeatureExtractor
 from model.vae3d.autoencoder import MichelangeloLikeAutoencoderWrapper
+from copy import deepcopy
+
+import ablations
 
 # Same presets as infer_shape.py: (num_images, token_multiplier, num_denoising_steps)
 preset_configs = {
@@ -127,6 +130,23 @@ def parse_args():
         "--save_visualization",
         action="store_true",
         help="Save visualization of prediction vs ground truth.",
+    )
+    parser.add_argument(
+        "--ablations",
+        nargs="+",
+        default=["baseline"],
+        help=(
+            "Input-ablation names to run, in order. Known: baseline, "
+            "drop_images, drop_masks, drop_boxes, drop_intext, "
+            "jitter_0.005, jitter_0.01, jitter_0.02, jitter_0.05, "
+            "jitter_0.075, jitter_0.1. Use 'all' for the full suite."
+        ),
+    )
+    parser.add_argument(
+        "--ablation_seed",
+        type=int,
+        default=0,
+        help="RNG seed for jitter noise (deterministic across reruns).",
     )
 
     args = parser.parse_args()
@@ -323,7 +343,10 @@ def print_summary(all_results):
     return summary
 
 
-def _run_evaluation(pkl_paths, args, device, worker_id=None):
+def _run_evaluation(
+    pkl_paths, args, device, model_bundle, *,
+    batch_transform=None, ablation_name="baseline", worker_id=None,
+):
     """Run inference and evaluation on a subset of samples.
 
     Core loop extracted for reuse in single-GPU and multi-GPU paths.
@@ -334,7 +357,7 @@ def _run_evaluation(pkl_paths, args, device, worker_id=None):
         model, vae, text_feature_extractor,
         config, _, num_images, num_steps,
         token_count, embed_dim, use_shifted_sampling,
-    ) = load_model(args.config, device=device)
+    ) = model_bundle
 
     all_results = []
     skipped = []
@@ -361,6 +384,9 @@ def _run_evaluation(pkl_paths, args, device, worker_id=None):
             batch_names = list(batch["name"])
 
             has_gt = "vertices" in batch and "faces" in batch
+
+            if batch_transform is not None:
+                batch = batch_transform(deepcopy(batch))
 
             batch = InferenceDataset.move_batch_to_device(
                 batch, device, dtype=torch.bfloat16
@@ -429,7 +455,7 @@ def _run_evaluation(pkl_paths, args, device, worker_id=None):
                         vis_masks,
                         batch["caption"][i],
                         sample_name=name,
-                        save_path=str(output_dir / f"VIS__{name}.jpg"),
+                        save_path=str(output_dir / f"VIS__{ablation_name}__{name}.jpg"),
                     )
 
                 if args.save_meshes:
@@ -443,7 +469,8 @@ def _run_evaluation(pkl_paths, args, device, worker_id=None):
                     pred_mesh_save.export(pred_tmp_path)
                     pred_mesh_save = trimesh.load(pred_tmp_path, force="mesh")
                     pred_mesh_save.export(
-                        output_dir / (name + ".glb"), include_normals=True
+                        output_dir / f"{ablation_name}__{name}.glb",
+                        include_normals=True,
                     )
 
                     gt_mesh_save = trimesh.Trimesh(vertices=gt_verts, faces=gt_faces)
@@ -464,9 +491,31 @@ def _run_evaluation(pkl_paths, args, device, worker_id=None):
                     gt_vis.visual.face_colors = [34, 139, 34, 180]
                     pair_scene.add_geometry(pred_vis, geom_name="pred")
                     pair_scene.add_geometry(gt_vis, geom_name="gt")
-                    pair_scene.export(output_dir / f"PAIR__{name}.glb")
+                    pair_scene.export(
+                        output_dir / f"PAIR__{ablation_name}__{name}.glb"
+                    )
 
     return all_results, skipped
+
+
+def print_cross_ablation_table(results_by_ablation):
+    """One-line-per-ablation summary printed at end of main."""
+    print("\n" + "=" * 78)
+    print(f"{'Ablation':<22}{'CD(x10^2)':<18}{'NC':<18}{'F1':<18}")
+    print("-" * 78)
+    for ablation_name, block in results_by_ablation.items():
+        s = block["summary"] or {}
+        cd = s.get("CD(×10²)", {})
+        nc = s.get("normals", {})
+        f1 = s.get("f-score", {})
+        def _fmt(d):
+            if not d:
+                return "-"
+            return f"{d['mean']:.3f} ± {d['std']:.3f}"
+        print(
+            f"{ablation_name:<22}{_fmt(cd):<18}{_fmt(nc):<18}{_fmt(f1):<18}"
+        )
+    print("=" * 78)
 
 
 def main():
@@ -482,21 +531,40 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
-        f"\nRunning inference (config={args.config}, batch_size={args.batch_size})...\n"
+        f"\nLoading model (config={args.config}, batch_size={args.batch_size})...\n"
     )
-    all_results, skipped = _run_evaluation(pkl_paths, args, device)
+    model_bundle = load_model(args.config, device=device)
+    config = model_bundle[3]
+    num_bins = config.encoder.num_bins
 
-    summary = print_summary(all_results)
+    ablation_items = ablations.resolve(
+        args.ablations, num_bins=num_bins, seed=args.ablation_seed
+    )
+
+    results_by_ablation = {}
+    for ablation_name, transform in ablation_items:
+        print(f"\n==== Ablation: {ablation_name} ====")
+        all_results, skipped = _run_evaluation(
+            pkl_paths, args, device, model_bundle,
+            batch_transform=transform, ablation_name=ablation_name,
+        )
+        summary = print_summary(all_results)
+        results_by_ablation[ablation_name] = {
+            "summary": summary,
+            "num_samples": len(all_results),
+            "num_skipped": len(skipped),
+            "skipped": skipped,
+            "per_sample": all_results,
+        }
+
+    print_cross_ablation_table(results_by_ablation)
 
     output_data = {
         "config": args.config,
         "batch_size": args.batch_size,
         "n_points": args.n_points,
-        "num_samples": len(all_results),
-        "num_skipped": len(skipped),
-        "skipped": skipped,
-        "summary": summary,
-        "per_sample": all_results,
+        "ablation_seed": args.ablation_seed,
+        "ablations": results_by_ablation,
     }
     with open(eval_output, "w") as f:
         json.dump(output_data, f, indent=2)
